@@ -15,7 +15,27 @@
             <strong>Birthdate:</strong> {{ user.birthdate or "N/A" }}<br>
             <strong>Joined:</strong> {{ user.created_at|datetimeformat }}
           </p>
+
+          {# Design Claim 18 (positive performance feedback enhances motivation):
+             Shows personalized stats visible ONLY to the profile owner.
+             This positive feedback loop encourages continued participation:
+             - Total reactions received on all posts
+             - Total comments received across all posts  
+             - Feedback on latest post with reaction/comment count
+          #}
           <p class="card-text">{{ user.profile or "No profile information provided." }}</p>
+
+          {% if session.get('user_id') == user.id %}
+          <div class="alert alert-light border mt-3">
+            <strong>Your stats:</strong>
+            Your posts have earned <strong>{{ total_reactions_received }}</strong> reaction{{ 's' if total_reactions_received != 1 }}
+            and <strong>{{ total_comments_received }}</strong> comment{{ 's' if total_comments_received != 1 }} in total.
+            {% if last_post_feedback %}
+              <br>Your latest post got <strong>{{ last_post_feedback.reactions }}</strong> reaction{{ 's' if last_post_feedback.reactions != 1 }}
+              and <strong>{{ last_post_feedback.comments }}</strong> comment{{ 's' if last_post_feedback.comments != 1 }} so far.
+            {% endif %}
+          </div>
+          {% endif %}
 
          {% if session.user_id and session.user_id != user.id %}
             <div class="my-3">

@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -6,7 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -42,6 +42,40 @@ def get_db():
 
     return g.db
 
+def get_daily_goal_progress(user_id):
+    """
+    Design Claim 13 & 15 (Ch. 2): specific, challenging goals with frequent
+    feedback increase contribution. Goal: post at least once a day.
+    """
+    rows = query_db(
+        "SELECT DISTINCT DATE(created_at) as post_date FROM posts WHERE user_id = ?",
+        (user_id,)
+    )
+    post_dates = set(r['post_date'] for r in rows) if rows else set()
+
+    today = datetime.utcnow().date()
+    posted_today = today.isoformat() in post_dates
+
+    # Consecutive-day streak, counting back from today (or yesterday if today's not done yet)
+    streak = 0
+    check_date = today if posted_today else today - timedelta(days=1)
+    while check_date.isoformat() in post_dates:
+        streak += 1
+        check_date -= timedelta(days=1)
+
+    # Rolling 7-day window progress
+    days_this_week = sum(
+        1 for i in range(7)
+        if (today - timedelta(days=i)).isoformat() in post_dates
+    )
+
+    return {
+        'posted_today': posted_today,
+        'streak': streak,
+        'days_this_week': days_this_week,
+        'goal_days': 7,
+        'progress_pct': round((days_this_week / 7) * 100)
+    }
 
 @app.teardown_appcontext
 def close_connection(exception):
@@ -94,9 +128,21 @@ REACTION_EMOJIS = {
 }
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
 
-
 @app.route('/')
 def feed():
+    """
+    Design Claim 12 (Ch. 2): people are more likely to comply with a request when they see that other people have also complied.
+    
+    This route displays the main feed of posts with two key features implementing social proof:
+    1. Total post count on feed - shows community activity level encouraging new users to join in
+    
+    Design Claim 13 & 15 (Ch. 2): specific/challenging goals + frequent feedback increase contribution
+    2. Daily posting goal progress bar for logged-in users showing:
+       - Whether they posted today (immediate feedback)
+       - Rolling 7-day window progress against a goal of posting once per day
+       - Consecutive-day streak counter
+    """
+    
     #  1. Get Pagination and Filter Parameters 
     try:
         page = int(request.args.get('page', 1))
@@ -112,6 +158,14 @@ def feed():
     current_user_id = session.get('user_id')
     params = []
 
+    daily_goal = get_daily_goal_progress(current_user_id) if current_user_id else None
+    
+    # Design Claim 12 (social proof): show total posts made so far,
+    # since all sample posts are pre-dated and "today" would always be 0
+    total_post_count = query_db(
+        "SELECT COUNT(*) as cnt FROM posts",
+        one=True
+    )['cnt']
     #  2. Build the Query 
     where_clause = ""
     if show == 'following' and current_user_id:
@@ -199,7 +253,9 @@ def feed():
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           total_post_count=total_post_count,
+                           daily_goal=daily_goal)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -270,7 +326,16 @@ def delete_post(post_id):
 
 @app.route('/u/<username>')
 def user_profile(username):
-    """Displays a user's profile page with moderated bio, posts, and latest comments."""
+    """
+    Design Claim 18 (Ch. 2): positive performance feedback enhances motivation toward a goal.
+    
+    This route displays a user's profile page with their stats and latest activity:
+    - For the profile owner only: Shows total reactions, comments received, and feedback on last post
+      This positive feedback helps motivate continued contribution to the community
+    
+    The feedback is shown exclusively to the profile owner (checked via session.get('user_id') == user.id)
+    ensuring it functions as personal reinforcement rather than public social comparison.
+    """
     
     user_raw = query_db('SELECT * FROM users WHERE username = ?', (username,), one=True)
     if not user_raw:
@@ -287,6 +352,25 @@ def user_profile(username):
         moderated_post_content, _ = moderate_content(post['content'])
         post['content'] = moderated_post_content
         posts.append(post)
+
+    # ---- Design Claim 18: performance feedback ----
+    total_reactions_received = query_db(
+        'SELECT COUNT(*) as cnt FROM reactions r JOIN posts p ON r.post_id = p.id WHERE p.user_id = ?',
+        (user['id'],), one=True
+    )['cnt']
+    total_comments_received = query_db(
+        'SELECT COUNT(*) as cnt FROM comments c JOIN posts p ON c.post_id = p.id WHERE p.user_id = ?',
+        (user['id'],), one=True
+    )['cnt']
+
+    last_post_feedback = None
+    if posts:
+        last_post = posts[0]
+        last_post_feedback = {
+            'reactions': query_db('SELECT COUNT(*) as cnt FROM reactions WHERE post_id = ?', (last_post['id'],), one=True)['cnt'],
+            'comments': query_db('SELECT COUNT(*) as cnt FROM comments WHERE post_id = ?', (last_post['id'],), one=True)['cnt']
+        }
+    # ------------------------------------------------------------------------
 
     comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],))
     comments = []
@@ -320,7 +404,10 @@ def user_profile(username):
                            comments=comments,
                            followers_count=followers_count, 
                            following_count=following_count,
-                           is_following=is_currently_following)
+                           is_following=is_currently_following,
+                           total_reactions_received=total_reactions_received,
+                           total_comments_received=total_comments_received,
+                           last_post_feedback=last_post_feedback)
     
 
 @app.route('/u/<username>/followers')
