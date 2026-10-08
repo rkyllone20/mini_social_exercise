@@ -46,10 +46,40 @@
 {% endif %}
 
 <h2 class="text-center border-bottom pb-2 mb-4"><span>Posts</span></h2>
-{% if total_post_count > 0 %}
-<p class="text-center text-muted mb-3">
-  🔥 {{ total_post_count }} post{% if total_post_count != 1 %}s{% endif %} on MiniSocial so far — join in!
-</p>
+{% if recent_activity %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h6 class="card-title">🔥 Recent activity on MiniSocial</h6>
+      <p class="text-muted small mb-2">
+        {{ total_post_count }} post{% if total_post_count != 1 %}s{% endif %} in total,
+        {{ recent_activity.week_total }} of them between {{ recent_activity.start_date }} and {{ recent_activity.end_date }} — join in!
+      </p>
+
+      {% for day in recent_activity.daily %}
+      <div class="d-flex align-items-center mb-1">
+        <small class="text-muted" style="width: 90px;">{{ day.d }}</small>
+        <div class="progress flex-grow-1" style="height: 14px;">
+          <div class="progress-bar" role="progressbar" style="width: {{ day.pct }}%;"></div>
+        </div>
+        <small class="ms-2" style="width: 30px;">{{ day.cnt }}</small>
+      </div>
+      {% endfor %}
+
+      {% if recent_activity.followed_activity is not none %}
+      <hr>
+      <small class="text-muted d-block mb-1">Posts from people you follow in this period:</small>
+      {% if recent_activity.followed_activity %}
+        {% for f in recent_activity.followed_activity %}
+        <span class="badge bg-secondary me-1">{{ f.username }}: {{ f.cnt }}</span>
+        {% endfor %}
+      {% else %}
+        <small class="text-muted">None yet. Follow some users to see their activity here.</small>
+      {% endif %}
+      {% endif %}
+    </div>
+  </div>
+</div>
 {% endif %}
 
 <div class="mb-4 text-center">

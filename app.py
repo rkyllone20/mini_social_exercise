@@ -122,6 +122,54 @@ def datetimeformat(value):
         return "N/A"
     return dt.strftime('%b %d, %Y %H:%M')
 
+def get_recent_activity(user_id):
+    """
+    Design Claim 12 (Ch. 2): people are more likely to contribute when they
+    see that others have contributed (social proof).
+    Shows posts per day for the last 7 days that have activity. The sample
+    data is old, so calendar days relative to today would always be empty.
+    Also shows posts from followed users within the same period.
+    """
+    rows = query_db(
+        "SELECT DATE(created_at) AS d, COUNT(*) AS cnt FROM posts "
+        "GROUP BY DATE(created_at) ORDER BY d DESC LIMIT 7"
+    )
+    if not rows:
+        return None
+
+    daily = [dict(r) for r in reversed(rows)]  # oldest -> newest
+    max_count = max(d['cnt'] for d in daily)
+    for d in daily:
+        d['pct'] = round(d['cnt'] / max_count * 100)
+
+    start_date = daily[0]['d']
+    end_date = daily[-1]['d']
+    week_total = sum(d['cnt'] for d in daily)
+
+    followed_activity = None
+    if user_id:
+        followed_rows = query_db(
+            """
+            SELECT u.username, COUNT(*) AS cnt
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)
+              AND DATE(p.created_at) BETWEEN ? AND ?
+            GROUP BY u.id
+            ORDER BY cnt DESC
+            """,
+            (user_id, start_date, end_date)
+        )
+        followed_activity = [dict(r) for r in followed_rows]
+
+    return {
+        'daily': daily,
+        'start_date': start_date,
+        'end_date': end_date,
+        'week_total': week_total,
+        'followed_activity': followed_activity
+    }
+
 REACTION_EMOJIS = {
     'like': '❤️', 'love': '😍', 'laugh': '😂',
     'wow': '😮', 'sad': '😢', 'angry': '😠',
@@ -166,6 +214,7 @@ def feed():
         "SELECT COUNT(*) as cnt FROM posts",
         one=True
     )['cnt']
+    recent_activity = get_recent_activity(current_user_id)
     #  2. Build the Query 
     where_clause = ""
     if show == 'following' and current_user_id:
@@ -255,7 +304,8 @@ def feed():
                            reaction_emojis=REACTION_EMOJIS,
                            reaction_types=REACTION_TYPES,
                            total_post_count=total_post_count,
-                           daily_goal=daily_goal)
+                           daily_goal=daily_goal,
+                           recent_activity=recent_activity)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
