@@ -280,11 +280,11 @@ def feed():
         reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
         comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
         post_dict = dict(post)
-        post_dict['content'], _ = moderate_content(post_dict['content'])
+        post_dict['content'], post_dict['flag'] = moderate_with_flag(post_dict['content'])
         comments_moderated = []
         for comment in comments_raw:
             comment_dict = dict(comment)
-            comment_dict['content'], _ = moderate_content(comment_dict['content'])
+            comment_dict['content'], comment_dict['flag'] = moderate_with_flag(comment_dict['content'])
             comments_moderated.append(comment_dict)
         posts_data.append({
             'post': post_dict,
@@ -1021,11 +1021,60 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
     
-    score = 0
+    # Rule 2.2: weighted average of the user's profile, posts and comments
+    user = query_db('SELECT profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user:
+        return 0.0
 
-    return score;
+    # Step 1: profile score
+    _, profile_score = moderate_content(user['profile'] or '')
 
-    
+    # Step 2: average post score (0 if the user has no posts)
+    post_rows = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    post_scores = [moderate_content(r['content'])[1] for r in post_rows] if post_rows else []
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0
+
+    # Step 3: average comment score (0 if the user has no comments)
+    comment_rows = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    comment_scores = [moderate_content(r['content'])[1] for r in comment_rows] if comment_rows else []
+    average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0
+
+    # Step 4: combine with weights 1 / 3 / 1
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    # Step 5: account-age multiplier
+    created_at = user['created_at']
+    if isinstance(created_at, str):
+        created_at = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+    account_age_days = (datetime.utcnow() - created_at).days
+
+    if account_age_days < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+
+    # Step 6: cap at 5.0
+    return min(5.0, float(user_risk_score))
+
+
+ # Compiled once and cached. /admin scores every user, post and comment,
+# so rebuilding these regexes on every call would be very slow.
+_PATTERNS = {}
+
+def _term_pattern(name, terms):
+    """Case-insensitive whole-word/whole-phrase regex for a word list (built once)."""
+    if name not in _PATTERNS:
+        escaped = sorted({re.escape(t.strip()) for t in terms if t and t.strip()},
+                         key=len, reverse=True)
+        _PATTERNS[name] = (re.compile(r'(?<!\w)(?:' + '|'.join(escaped) + r')(?!\w)',
+                                      re.IGNORECASE) if escaped else None)
+    return _PATTERNS[name]
+
+# URLs start with http://, https:// or www.; trailing punctuation is not part of the link
+_URL_PATTERN = re.compile(r'(?:https?://|www\.)\S*[^\s.,!?;:)\]}\'"]', re.IGNORECASE)
+
 # Assignment 2.1
 def moderate_content(content):
     """
@@ -1044,10 +1093,81 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
+    if not content:
+        return content or '', 0.0
+
+    # Rule 1.1.1: Tier 1 words -> remove everything, score 5.0
+    tier1 = _term_pattern('tier1', TIER1_WORDS)
+    if tier1 and tier1.search(content):
+        return '[content removed due to severe violation]', 5.0
+
+    # Rule 1.1.2: Tier 2 phrases -> remove everything, score 5.0
+    tier2 = _term_pattern('tier2', TIER2_PHRASES)
+    if tier2 and tier2.search(content):
+        return '[content removed due to spam/scam policy]', 5.0
+
     moderated_content = content
-    score = 0
-    
+    score = 0.0
+
+    # Rule 1.2.1: Tier 3 words -> asterisks of the same length, +2.0 each
+    tier3 = _term_pattern('tier3', TIER3_WORDS)
+    if tier3:
+        moderated_content, n_tier3 = tier3.subn(
+            lambda m: '*' * len(m.group(0)), moderated_content)
+        score += 2.0 * n_tier3
+
+    # Rule 1.2.2: external links -> [link removed], +2.0 each
+    moderated_content, n_links = _URL_PATTERN.subn('[link removed]', moderated_content)
+    score += 2.0 * n_links
+
+    # Rule 1.2.3: excessive capitalization (>15 letters and >70% uppercase), +0.5.
+    # Measured on the original text; the content itself is not modified.
+    letters = [c for c in content if c.isalpha()]
+    if len(letters) > 15 and sum(c.isupper() for c in letters) / len(letters) > 0.70:
+        score += 0.5
+
     return moderated_content, score
+
+# Assignment 2 - Design Claim 1 (Ch. 4): moderation systems that label, degrade
+# or remove inappropriate messages limit the damage they cause. Moderation is
+# also more effective when people see it as legitimate, so every flag explains
+# why it happened. The text is blurred (degraded) but still available behind a
+# "Reveal" button, so the speaker is not silenced.
+FLAG_THRESHOLD = 1.0  # a score of 1.0 or more is at least "LOW" risk
+
+def moderate_with_flag(content):
+    """
+    Runs moderate_content() and, if the result is risky enough, also returns a
+    'flag' dict with the risk level and human-readable reasons for the template.
+    Returns: (moderated_content, flag_or_None)
+    """
+    moderated, score = moderate_content(content)
+    if score < FLAG_THRESHOLD:
+        return moderated, None
+
+    reasons = []
+    if moderated == '[content removed due to severe violation]':
+        reasons.append('severe language (content removed)')
+    elif moderated == '[content removed due to spam/scam policy]':
+        reasons.append('spam or scam content (content removed)')
+    else:
+        tier3 = _term_pattern('tier3', TIER3_WORDS)
+        if tier3 and tier3.search(content):
+            reasons.append('mild profanity (masked)')
+        if _URL_PATTERN.search(content):
+            reasons.append('an external link (removed)')
+
+    level = 'HIGH' if score >= 5.0 else 'MEDIUM' if score >= 3.0 else 'LOW'
+    removed = moderated.startswith('[content removed due to')
+    return moderated, {
+        'removed': removed,
+        'level': level,
+        'reasons': reasons,
+        'score': score,
+        # Original text is only passed on for mild cases (the Reveal button).
+        # Severe (Tier 1/2) content is never sent to the page.
+        'original': None if removed else content,
+    }
 
 # Coding Assignment #3
 # Assignment 3.1
@@ -1077,4 +1197,3 @@ def recommend(user_id, filter_following):
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
-

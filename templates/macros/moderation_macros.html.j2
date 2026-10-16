@@ -1,0 +1,21 @@
+{% macro moderated_text(content, flag, css_class='') %}
+{% if flag %}
+<div class="mod-flag border rounded p-2 mb-2 small" style="background:#fff8e1;">
+  <strong>&#9888; Flagged ({{ flag.level }} risk):</strong>
+  Reason: {{ flag.reasons|join(', ') }}.
+  {% if not flag.removed %}Click Reveal to see the original message.{% endif %}
+  <a href="{{ url_for('rules') }}">See the rules</a>
+</div>
+{% if flag.removed %}
+<p class="{{ css_class }}">{{ content }}</p>
+{% else %}
+<p class="{{ css_class }}">
+  <span class="mod-filtered" style="filter: blur(6px);">{{ content }}</span><span class="mod-original" style="display:none;">{{ flag.original }}</span>
+</p>
+<button type="button" class="btn btn-sm btn-light mb-2"
+        onclick="var p=this.previousElementSibling; var f=p.querySelector('.mod-filtered'); var o=p.querySelector('.mod-original'); var hidden=(o.style.display==='none'); f.style.display=hidden?'none':''; o.style.display=hidden?'':'none'; this.textContent=hidden?'Hide':'Reveal';">Reveal</button>
+{% endif %}
+{% else %}
+<p class="{{ css_class }}">{{ content }}</p>
+{% endif %}
+{% endmacro %}

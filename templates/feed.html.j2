@@ -1,6 +1,7 @@
 {% extends "base.html.j2" %}
 {% block content %}
 {% from "macros/user_macros.html.j2" import user_display %}
+{% from "macros/moderation_macros.html.j2" import moderated_text %}
 
 <div class="align-center text-center">
   <img src="{{ url_for('static', filename='icon.png') }}" alt="Logo" style="height: 64px;" class="mb-4">
@@ -134,7 +135,7 @@
         {% endif %}
       </div>
       
-      <p class="mt-2">{{ entry.post.content }}</p>
+      {{ moderated_text(entry.post.content, entry.post.flag, 'mt-2') }}
 
       <!-- Reactions Display and Add Reaction Button -->
       <div class="d-flex align-items-center mt-2 mb-2">
@@ -197,7 +198,7 @@
           <div class="d-flex justify-content-between">
             <div>
               <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a></strong>
-              <p class="mb-0">{{ comment.content }}</p>
+              {{ moderated_text(comment.content, comment.flag, 'mb-0') }}
             </div>
             
             {% if session.get('user_id') == comment.user_id or session.get('user_id') == entry.post.user_id %}
