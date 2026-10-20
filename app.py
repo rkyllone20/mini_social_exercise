@@ -6,6 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
+import math
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -170,6 +171,141 @@ def get_recent_activity(user_id):
         'followed_activity': followed_activity
     }
 
+# ---------------------------------------------------------------------------
+# Coding Assignment #3 - Dealing with newcomers (Chapter 5)
+# ---------------------------------------------------------------------------
+NEWCOMER_DAYS = 7    # "new account" threshold, same as in the moderation rules
+MEMBER_DAYS = 30
+
+# Design Claim 25 (Ch. 5): "Progressive access controls reduce the harm a
+# newcomer can do to a community while learning the ropes."
+# New accounts get small daily limits that grow as the account gets older.
+ACCESS_LEVELS = [
+    # (level name, minimum account age in days, posts per day, comments per day)
+    ('Newcomer', 0, 3, 10),
+    ('Member', NEWCOMER_DAYS, 10, 30),
+    ('Established', MEMBER_DAYS, None, None),   # None = no limit
+]
+
+# Design Claim 19 (Ch. 5): "Encouraging newcomers to reveal themselves publicly
+# in profiles or introduction threads gives existing group members a basis for
+# conversation and reciprocation with them and increases interaction between
+# old-timers and newcomers."
+# A newcomer's first post is treated as their introduction. A welcome is a
+# comment on that post that starts with WELCOME_PREFIX.
+WELCOME_PREFIX = 'Welcome to MiniSocial,'
+
+
+def get_account_age_days(created_at):
+    """Account age in whole days (created_at may be a datetime or a text timestamp)."""
+    if not created_at:
+        return 10**6  # unknown creation date: treat as an old account
+    if isinstance(created_at, str):
+        created_at = datetime.strptime(created_at[:19], '%Y-%m-%d %H:%M:%S')
+    return (datetime.utcnow() - created_at).days
+
+
+def get_access_level(user_id):
+    """Design Claim 25: the user's access level, today's usage and what unlocks next."""
+    user = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,), one=True)
+    age = get_account_age_days(user['created_at']) if user else 10**6
+
+    index = 0
+    for i, level in enumerate(ACCESS_LEVELS):
+        if age >= level[1]:
+            index = i
+    name, _, post_limit, comment_limit = ACCESS_LEVELS[index]
+    next_level = ACCESS_LEVELS[index + 1] if index + 1 < len(ACCESS_LEVELS) else None
+
+    posts_today = query_db(
+        "SELECT COUNT(*) AS cnt FROM posts WHERE user_id = ? AND DATE(created_at) = DATE('now')",
+        (user_id,), one=True)['cnt']
+    comments_today = query_db(
+        "SELECT COUNT(*) AS cnt FROM comments WHERE user_id = ? AND DATE(created_at) = DATE('now')",
+        (user_id,), one=True)['cnt']
+
+    return {
+        'name': name,
+        'age_days': age,
+        'post_limit': post_limit,
+        'comment_limit': comment_limit,
+        'posts_today': posts_today,
+        'comments_today': comments_today,
+        'post_pct': min(100, round(posts_today / post_limit * 100)) if post_limit else 0,
+        'comment_pct': min(100, round(comments_today / comment_limit * 100)) if comment_limit else 0,
+        'next_name': next_level[0] if next_level else None,
+        'days_to_next': (next_level[1] - age) if next_level else 0,
+    }
+
+
+def check_access_limit(user_id, action):
+    """Design Claim 25: may this user post/comment right now? Returns (allowed, message)."""
+    level = get_access_level(user_id)
+    if action == 'post':
+        limit, used = level['post_limit'], level['posts_today']
+    else:
+        limit, used = level['comment_limit'], level['comments_today']
+    if limit is not None and used >= limit:
+        unlock = ''
+        if level['next_name']:
+            unlock = (f" You will reach the {level['next_name']} level in "
+                      f"{level['days_to_next']} day(s), which allows more.")
+        return False, f"Daily limit reached: {level['name']} accounts can make {limit} {action}s per day.{unlock}"
+    return True, ''
+
+
+def get_first_post_id(user_id):
+    """The user's first post, which counts as their introduction."""
+    row = query_db('SELECT id FROM posts WHERE user_id = ? ORDER BY created_at ASC, id ASC LIMIT 1',
+                   (user_id,), one=True)
+    return row['id'] if row else None
+
+
+def count_welcomes(post_id, newcomer_id):
+    """How many other members have welcomed the newcomer on this introduction post."""
+    return query_db(
+        'SELECT COUNT(*) AS cnt FROM comments WHERE post_id = ? AND user_id != ? AND content LIKE ?',
+        (post_id, newcomer_id, WELCOME_PREFIX + '%'), one=True)['cnt']
+
+
+def get_welcome_status(user_id):
+    """Design Claim 19: for a newcomer, whether they introduced themselves and who welcomed them.
+    Returns None for accounts that are no longer newcomers."""
+    user = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user or get_account_age_days(user['created_at']) >= NEWCOMER_DAYS:
+        return None
+    first_post = get_first_post_id(user_id)
+    return {
+        'introduced': first_post is not None,
+        'first_post_id': first_post,
+        'welcomes': count_welcomes(first_post, user_id) if first_post else 0,
+    }
+
+
+def get_new_members(viewer_id, limit=5):
+    """Design Claim 19: recent newcomers (account younger than 7 days) that other
+    members can welcome. Texts go through moderate_content() before display."""
+    rows = query_db(
+        "SELECT id, username, profile FROM users "
+        "WHERE created_at >= datetime('now', ?) AND id != ? "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        (f'-{NEWCOMER_DAYS} days', viewer_id or 0, limit))
+    members = []
+    for u in rows:
+        member = {'id': u['id'], 'username': u['username'],
+                  'profile': moderate_content(u['profile'] or '')[0][:120],
+                  'intro': None, 'welcomes': 0, 'welcomed': False}
+        first_post = query_db('SELECT id, content FROM posts WHERE user_id = ? '
+                              'ORDER BY created_at ASC, id ASC LIMIT 1', (u['id'],), one=True)
+        if first_post:
+            member['intro'] = moderate_content(first_post['content'])[0][:160]
+            member['welcomes'] = count_welcomes(first_post['id'], u['id'])
+            member['welcomed'] = bool(query_db(
+                'SELECT 1 FROM comments WHERE post_id = ? AND user_id = ? AND content LIKE ?',
+                (first_post['id'], viewer_id, WELCOME_PREFIX + '%'), one=True))
+        members.append(member)
+    return members
+
 REACTION_EMOJIS = {
     'like': '❤️', 'love': '😍', 'laugh': '😂',
     'wow': '😮', 'sad': '😢', 'angry': '😠',
@@ -215,6 +351,9 @@ def feed():
         one=True
     )['cnt']
     recent_activity = get_recent_activity(current_user_id)
+    access_level = get_access_level(current_user_id) if current_user_id else None
+    welcome_status = get_welcome_status(current_user_id) if current_user_id else None
+    new_members = get_new_members(current_user_id) if current_user_id else []
     #  2. Build the Query 
     where_clause = ""
     if show == 'following' and current_user_id:
@@ -305,7 +444,10 @@ def feed():
                            reaction_types=REACTION_TYPES,
                            total_post_count=total_post_count,
                            daily_goal=daily_goal,
-                           recent_activity=recent_activity)
+                           recent_activity=recent_activity,
+                           access_level=access_level,
+                           welcome_status=welcome_status,
+                           new_members=new_members)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -316,6 +458,12 @@ def add_post():
     if not user_id:
         flash('You must be logged in to create a post.', 'danger')
         return redirect(url_for('login'))
+
+    # Design Claim 25 (Ch. 5): progressive access controls - daily limits for newer accounts
+    allowed, limit_message = check_access_limit(user_id, 'post')
+    if not allowed:
+        flash(limit_message, 'warning')
+        return redirect(url_for('feed'))
 
     # Get content from the submitted form
     content = request.form.get('content')
@@ -625,6 +773,12 @@ def add_comment(post_id):
     if not user_id:
         flash('You must be logged in to comment.', 'danger')
         return redirect(url_for('login'))
+
+    # Design Claim 25 (Ch. 5): progressive access controls - daily limits for newer accounts
+    allowed, limit_message = check_access_limit(user_id, 'comment')
+    if not allowed:
+        flash(limit_message, 'warning')
+        return redirect(request.referrer or url_for('post_detail', post_id=post_id))
 
     # Get content from the submitted form
     content = request.form.get('content')
@@ -989,6 +1143,48 @@ def admin_delete_comment(comment_id):
     flash(f'Comment {comment_id} has been deleted.', 'success')
     return redirect(url_for('admin_dashboard'))
 
+@app.route('/welcome/<int:newcomer_id>', methods=['POST'])
+def welcome_newcomer(newcomer_id):
+    """Design Claim 19: an existing member welcomes a newcomer on their introduction post."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to welcome someone.', 'danger')
+        return redirect(url_for('login'))
+    if user_id == newcomer_id:
+        flash('You cannot welcome yourself.', 'warning')
+        return redirect(request.referrer or url_for('feed'))
+
+    newcomer = query_db('SELECT id, username FROM users WHERE id = ?', (newcomer_id,), one=True)
+    if not newcomer:
+        flash('That user does not exist.', 'danger')
+        return redirect(request.referrer or url_for('feed'))
+
+    first_post = get_first_post_id(newcomer_id)
+    if not first_post:
+        flash(f"{newcomer['username']} has not posted an introduction yet.", 'info')
+        return redirect(request.referrer or url_for('feed'))
+
+    already = query_db('SELECT 1 FROM comments WHERE post_id = ? AND user_id = ? AND content LIKE ?',
+                       (first_post, user_id, WELCOME_PREFIX + '%'), one=True)
+    if already:
+        flash(f"You have already welcomed {newcomer['username']}.", 'info')
+        return redirect(request.referrer or url_for('feed'))
+
+    # Welcomes are comments, so they count towards the daily comment limit
+    allowed, message = check_access_limit(user_id, 'comment')
+    if not allowed:
+        flash(message, 'warning')
+        return redirect(request.referrer or url_for('feed'))
+
+    db = get_db()
+    db.execute('INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
+               (first_post, user_id,
+                f"{WELCOME_PREFIX} {newcomer['username']}! Glad to have you here. "
+                "Feel free to ask if you need anything."))
+    db.commit()
+    flash(f"You welcomed {newcomer['username']}.", 'success')
+    return redirect(request.referrer or url_for('feed'))
+
 @app.route('/rules')
 def rules():
     return render_template('rules.html.j2')
@@ -1169,6 +1365,30 @@ def moderate_with_flag(content):
         'original': None if removed else content,
     }
 
+# ---- Assignment 3.1 helpers: content-based recommender ----
+# Reactions that count as positive interest (sad / angry are ignored)
+POSITIVE_REACTIONS = {'like': 1.0, 'love': 1.5, 'haha': 1.0, 'laugh': 1.0, 'wow': 1.0}
+RECOMMENDER_STOPWORDS = set("""a about after all also am an and any are as at be because been but by can could did do does
+for from get got had has have he her here him his how i if in into is it its just like me more most my no not now of
+on one or our out over so some than that the their them then there these they this to too up us was we were what when
+which who why will with would you your really very much still even""".split())
+HASHTAG_WEIGHT = 3.0         # hashtags are the strongest topic signal
+FOLLOW_AUTHOR_WEIGHT = 0.5   # how much a followed user's posts shape the profile
+FOLLOW_BONUS = 0.15          # score bonus for posts by followed users
+AUTHOR_BONUS = 0.10          # score bonus for authors the user has liked before
+POPULARITY_WEIGHT = 0.02     # tiny prior: helps new users and breaks ties
+
+def _recommender_tokens(text):
+    """Word counts for a post. Hashtags are stored without '#' and weighted higher."""
+    text = (text or '').lower()
+    counts = collections.Counter()
+    for tag in re.findall(r'#(\w+)', text):
+        counts[tag] += HASHTAG_WEIGHT
+    for word in re.findall(r"[a-z']{3,}", re.sub(r'#\w+', ' ', text)):
+        if word not in RECOMMENDER_STOPWORDS:
+            counts[word] += 1
+    return counts
+
 # Coding Assignment #3
 # Assignment 3.1
 def recommend(user_id, filter_following):
@@ -1191,9 +1411,81 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    # 1. Load all posts and compute TF-IDF word weights (rare words matter more)
+    rows = query_db('SELECT p.id, p.content, p.created_at, p.user_id, u.username '
+                    'FROM posts p JOIN users u ON p.user_id = u.id')
+    if not rows:
+        return []
+    by_id = {r['id']: r for r in rows}
+    tokens = {r['id']: _recommender_tokens(r['content']) for r in rows}
+    doc_freq = collections.Counter()
+    for t in tokens.values():
+        doc_freq.update(t.keys())
+    idf = {w: math.log((len(rows) + 1) / (c + 1)) + 1 for w, c in doc_freq.items()}
 
-    return recommended_posts;
+    def tfidf(counts):
+        return {w: (1 + math.log(c)) * idf[w] for w, c in counts.items()}
+
+    # 2. Popularity (positive reactions per post), used only as a tiny prior
+    pos_marks = ','.join('?' * len(POSITIVE_REACTIONS))
+    popularity = {r['post_id']: r['cnt'] for r in query_db(
+        f'SELECT post_id, COUNT(*) AS cnt FROM reactions WHERE reaction_type IN ({pos_marks}) GROUP BY post_id',
+        tuple(POSITIVE_REACTIONS))}
+
+    # 3. Build the user's interest profile from liked posts and followed users
+    followed, already_reacted = set(), set()
+    liked_authors = collections.Counter()
+    profile = collections.Counter()
+    if user_id:
+        followed = {r['followed_id'] for r in query_db(
+            'SELECT followed_id FROM follows WHERE follower_id = ?', (user_id,))}
+        for r in query_db('SELECT post_id, reaction_type FROM reactions WHERE user_id = ?', (user_id,)):
+            already_reacted.add(r['post_id'])
+            weight = POSITIVE_REACTIONS.get(r['reaction_type'])
+            if weight and r['post_id'] in by_id:
+                for term, value in tfidf(tokens[r['post_id']]).items():
+                    profile[term] += weight * value
+                liked_authors[by_id[r['post_id']]['user_id']] += 1
+        followed_posts = collections.defaultdict(list)
+        for r in rows:
+            if r['user_id'] in followed:
+                followed_posts[r['user_id']].append(r['id'])
+        for pids in followed_posts.values():
+            for pid in pids:
+                for term, value in tfidf(tokens[pid]).items():
+                    profile[term] += FOLLOW_AUTHOR_WEIGHT / len(pids) * value
+    profile_norm = math.sqrt(sum(v * v for v in profile.values()))
+
+    # 4. Score every candidate post
+    scored = []
+    for r in rows:
+        if r['user_id'] == user_id or r['id'] in already_reacted:
+            continue
+        if filter_following and r['user_id'] not in followed:
+            continue
+        score = POPULARITY_WEIGHT * math.log(1 + popularity.get(r['id'], 0))
+        if profile_norm:
+            vec = tfidf(tokens[r['id']])
+            norm = math.sqrt(sum(v * v for v in vec.values()))
+            if norm:
+                score += sum(profile[t] * v for t, v in vec.items() if t in profile) / (profile_norm * norm)
+        if r['user_id'] in followed:
+            score += FOLLOW_BONUS
+        if liked_authors[r['user_id']]:
+            score += AUTHOR_BONUS
+        scored.append((score, r))
+    scored.sort(key=lambda x: (x[0], x[1]['created_at']), reverse=True)
+
+    # 5. Take the best 5 (skipping posts moderation would remove), newest first
+    recommended_posts = []
+    for score, r in scored:
+        if moderate_content(r['content'])[1] >= 5.0:
+            continue
+        recommended_posts.append(r)
+        if len(recommended_posts) == 5:
+            break
+    recommended_posts.sort(key=lambda r: r['created_at'], reverse=True)
+    return recommended_posts
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)

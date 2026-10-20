@@ -46,6 +46,99 @@
 </div>
 {% endif %}
 
+{# ---- Design Claim 19: welcome newcomers (shown to accounts younger than 7 days) ---- #}
+{% if welcome_status %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h6 class="card-title">&#128075; Welcome to MiniSocial, {{ session.get('username') }}!</h6>
+      {% if not welcome_status.introduced %}
+      <p class="small mb-2">Introduce yourself with a short first post, so other members have something to reply to.</p>
+      <script>
+        function prefillIntro() {
+          var t = document.querySelector('form[action="{{ url_for('add_post') }}"] textarea');
+          if (!t) { return; }
+          t.value = {{ ("Hi, I'm " ~ session.get('username') ~ "! I'm from ... and I'm interested in ...")|tojson }};
+          t.focus();
+          t.scrollIntoView({behavior: 'smooth', block: 'center'});
+        }
+      </script>
+      <button type="button" class="btn btn-primary btn-sm" onclick="prefillIntro()">Write an introduction</button>
+      {% else %}
+      <p class="small mb-0">
+        Thanks for introducing yourself!
+        {% if welcome_status.welcomes %}
+          {{ welcome_status.welcomes }} member{% if welcome_status.welcomes != 1 %}s have{% else %} has{% endif %} welcomed you.
+          <a href="/posts/{{ welcome_status.first_post_id }}">See your welcomes</a>
+        {% else %}
+          Other members can now see your introduction and say hello.
+        {% endif %}
+      </p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{# ---- Design Claim 25: progressive access controls (limits grow with account age) ---- #}
+{% if access_level and access_level.name != 'Established' %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h6 class="card-title">&#128274; Your access level: {{ access_level.name }}</h6>
+      <small class="text-muted">Posts today: {{ access_level.posts_today }}/{{ access_level.post_limit }}</small>
+      <div class="progress mb-2" style="height: 10px;">
+        <div class="progress-bar {% if access_level.post_pct >= 100 %}bg-danger{% endif %}" role="progressbar" style="width: {{ access_level.post_pct }}%;"></div>
+      </div>
+      <small class="text-muted">Comments today: {{ access_level.comments_today }}/{{ access_level.comment_limit }}</small>
+      <div class="progress mb-2" style="height: 10px;">
+        <div class="progress-bar {% if access_level.comment_pct >= 100 %}bg-danger{% endif %}" role="progressbar" style="width: {{ access_level.comment_pct }}%;"></div>
+      </div>
+      {% if access_level.next_name %}
+      <small class="text-muted">Reach the <strong>{{ access_level.next_name }}</strong> level in {{ access_level.days_to_next }} day{% if access_level.days_to_next != 1 %}s{% endif %} to unlock higher limits.</small>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{# ---- Design Claim 19: new members that other members can welcome ---- #}
+{% if new_members %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h6 class="card-title">&#127793; New members, say hello</h6>
+      {% for m in new_members %}
+      <div class="d-flex justify-content-between align-items-start border-top py-2">
+        <div>
+          <strong>{{ user_display(m.username) }}</strong>
+          {% if m.intro %}
+            <div class="small">&ldquo;{{ m.intro }}&rdquo;</div>
+          {% elif m.profile %}
+            <div class="small">{{ m.profile }}</div>
+          {% else %}
+            <div class="small text-muted">Has not introduced themselves yet.</div>
+          {% endif %}
+          {% if m.welcomes %}
+            <small class="text-muted">{{ m.welcomes }} welcome{% if m.welcomes != 1 %}s{% endif %} so far</small>
+          {% endif %}
+        </div>
+        {% if m.intro is not none %}
+          {% if m.welcomed %}
+            <span class="badge bg-success">&#10003; You welcomed them</span>
+          {% else %}
+            <form action="{{ url_for('welcome_newcomer', newcomer_id=m.id) }}" method="POST">
+              <button type="submit" class="btn btn-primary btn-sm">Welcome</button>
+            </form>
+          {% endif %}
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <h2 class="text-center border-bottom pb-2 mb-4"><span>Posts</span></h2>
 {% if recent_activity %}
 <div class="col-md-8 mx-auto mb-4">
